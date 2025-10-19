@@ -1,0 +1,273 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include "driver/i2c.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// -------------------------- 1. 硬件参数配置（根据接线修改）--------------------------
+#define I2C_MASTER_NUM    I2C_NUM_0       // 使用I2C0总线
+#define I2C_MASTER_SDA_IO 8               // SDA引脚（左侧排针12号：GPIO8）
+#define I2C_MASTER_SCL_IO 9               // SCL引脚（左侧排针15号：GPIO9）
+#define I2C_MASTER_FREQ_HZ 100000         // I2C标准速率（100kHz）
+#define MPU6050_ADDR       0x68           // MPU6050默认地址（ADO接GND时）
+#define TASK_DELAY_MS      100            // 数据读取间隔（100ms → 10Hz刷新率）
+
+// -------------------------- 2. MPU6050寄存器地址定义 --------------------------
+#define MPU6050_REG_WHO_AM_I    0x75    // 设备ID寄存器（默认返回0x68）
+#define MPU6050_REG_PWR_MGMT_1  0x6B    // 电源管理寄存器1（控制睡眠模式）
+#define MPU6050_REG_SMPLRT_DIV  0x19    // 采样率分频器（控制数据输出频率）
+#define MPU6050_REG_ACCEL_CONFIG 0x1C   // 加速度计量程配置
+#define MPU6050_REG_GYRO_CONFIG  0x1B   // 陀螺仪量程配置
+#define MPU6050_REG_ACCEL_XOUT_H 0x3B   // 加速度计X轴高字节（数据起始地址）
+#define MPU6050_REG_GYRO_XOUT_H  0x43   // 陀螺仪X轴高字节（数据起始地址）
+
+// -------------------------- 3. 量程与灵敏度配置（可修改）--------------------------
+// 加速度计量程：±2g（默认），灵敏度 = 16384 LSB/g（1g=9.8m/s²）
+#define ACCEL_FS_SEL 0x00  
+#define ACCEL_SENSITIVITY 16384.0f  
+
+// 陀螺仪量程：±250°/s（默认），灵敏度 = 131 LSB/(°/s)
+#define GYRO_FS_SEL 0x00   
+#define GYRO_SENSITIVITY 131.0f  
+
+// 日志标签（方便过滤日志）
+static const char *TAG = "MPU6050_DATA";
+
+
+// -------------------------- 4. I2C总线初始化 --------------------------
+static esp_err_t i2c_master_init(void) {
+    // 配置I2C参数
+    i2c_config_t i2c_config = {
+        .mode = I2C_MODE_MASTER,          // 主机模式
+        .sda_io_num = I2C_MASTER_SDA_IO,  // SDA引脚
+        .scl_io_num = I2C_MASTER_SCL_IO,  // SCL引脚
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,  // 启用SDA上拉（增强通信稳定性）
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,  // 启用SCL上拉
+        .master.clk_speed = I2C_MASTER_FREQ_HZ // 通信速率
+    };
+
+    // 应用I2C配置
+    esp_err_t err = i2c_param_config(I2C_MASTER_NUM, &i2c_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C参数配置失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // 安装I2C驱动（0：不启用从机接收缓存，0：不启用从机发送缓存，0：无中断优先级）
+    err = i2c_driver_install(I2C_MASTER_NUM, I2C_MODE_MASTER, 0, 0, 0);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "I2C驱动安装失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "I2C初始化成功");
+    return ESP_OK;
+}
+
+
+// -------------------------- 5. MPU6050初始化（唤醒+配置）--------------------------
+static esp_err_t mpu6050_init(void) {
+    uint8_t data_buf;
+    esp_err_t err;
+
+    // 步骤1：读取WHO_AM_I寄存器，验证设备是否在线（正常返回0x68）
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();  // 创建I2C命令链
+    i2c_master_start(cmd);                         // 起始信号
+    // 写设备地址（左移1位 + 写标志（0））
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, MPU6050_REG_WHO_AM_I, true);  // 写寄存器地址
+    i2c_master_stop(cmd);                            // 停止信号
+    // 执行命令（超时时间：1000ms / 系统时钟周期）
+    err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);  // 销毁命令链
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "读取WHO_AM_I失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // 读取WHO_AM_I的返回值
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_READ, true);  // 读标志（1）
+    i2c_master_read_byte(cmd, &data_buf, I2C_MASTER_NACK);  // 读取1字节，无应答
+    i2c_master_stop(cmd);
+    err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "读取设备ID失败: %s", esp_err_to_name(err));
+        return err;
+    }
+    if (data_buf != 0x68) {  // 验证设备ID
+        ESP_LOGE(TAG, "设备不匹配！WHO_AM_I返回: 0x%02X（应为0x68）", data_buf);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    // 步骤2：唤醒MPU6050（默认上电为睡眠模式，需清除睡眠位）
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, MPU6050_REG_PWR_MGMT_1, true);  // 电源管理寄存器
+    i2c_master_write_byte(cmd, 0x00, true);  // 0x00：清除睡眠位（唤醒），使用内部时钟
+    i2c_master_stop(cmd);
+    err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "唤醒MPU6050失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // 步骤3：配置采样率（采样率 = 陀螺仪输出率 / (1 + SMPLRT_DIV)）
+    // 陀螺仪默认输出率1kHz → 1kHz/(1+9) = 100Hz（可修改SMPLRT_DIV调整）
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, MPU6050_REG_SMPLRT_DIV, true);  // 采样率分频器
+    i2c_master_write_byte(cmd, 0x09, true);  // 分频系数=9 → 100Hz采样率
+    i2c_master_stop(cmd);
+    err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "配置采样率失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // 步骤4：配置加速度计量程（±2g）
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, MPU6050_REG_ACCEL_CONFIG, true);  // 加速度计配置
+    i2c_master_write_byte(cmd, ACCEL_FS_SEL << 3, true);  // 量程配置（左移3位写入）
+    i2c_master_stop(cmd);
+    err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "配置加速度计量程失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // 步骤5：配置陀螺仪量程（±250°/s）
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, MPU6050_REG_GYRO_CONFIG, true);  // 陀螺仪配置
+    i2c_master_write_byte(cmd, GYRO_FS_SEL << 3, true);  // 量程配置（左移3位写入）
+    i2c_master_stop(cmd);
+    err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "配置陀螺仪量程失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    ESP_LOGI(TAG, "MPU6050初始化成功");
+    return ESP_OK;
+}
+
+
+// -------------------------- 6. 读取加速度计+陀螺仪数据 --------------------------
+typedef struct {
+    float ax;  // 加速度计X轴（单位：g）
+    float ay;  // 加速度计Y轴（单位：g）
+    float az;  // 加速度计Z轴（单位：g）
+    float gx;  // 陀螺仪X轴（单位：°/s）
+    float gy;  // 陀螺仪Y轴（单位：°/s）
+    float gz;  // 陀螺仪Z轴（单位：°/s）
+    int16_t ax_raw;  // 加速度计原始值（16位）
+    int16_t ay_raw;
+    int16_t az_raw;
+    int16_t gx_raw;  // 陀螺仪原始值（16位）
+    int16_t gy_raw;
+    int16_t gz_raw;
+} mpu6050_data_t;  // 数据结构体（存储原始值和物理值）
+
+static esp_err_t mpu6050_read_data(mpu6050_data_t *data) {
+    uint8_t buf[14];  // 加速度计6字节 + 陀螺仪6字节 + 温度2字节（共14字节）
+    esp_err_t err;
+
+    // 步骤1：指定读取的起始寄存器（加速度计X轴高字节）
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, MPU6050_REG_ACCEL_XOUT_H, true);  // 数据起始地址
+    i2c_master_stop(cmd);
+    err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "指定数据地址失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // 步骤2：读取14字节数据（加速度计6字节 + 温度2字节 + 陀螺仪6字节）
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (MPU6050_ADDR << 1) | I2C_MASTER_READ, true);
+    // 读取13字节（前13字节应答，最后1字节无应答）
+    i2c_master_read(cmd, buf, 13, I2C_MASTER_ACK);
+    i2c_master_read_byte(cmd, &buf[13], I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    err = i2c_master_cmd_begin(I2C_MASTER_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "读取数据失败: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    // 步骤3：组合原始数据（MPU6050数据为16位大端，高字节在前）
+    data->ax_raw = (buf[0] << 8) | buf[1];  // 加速度计X轴
+    data->ay_raw = (buf[2] << 8) | buf[3];  // 加速度计Y轴
+    data->az_raw = (buf[4] << 8) | buf[5];  // 加速度计Z轴
+    data->gx_raw = (buf[8] << 8) | buf[9];  // 陀螺仪X轴（跳过温度数据buf[6]-buf[7]）
+    data->gy_raw = (buf[10] << 8) | buf[11]; // 陀螺仪Y轴
+    data->gz_raw = (buf[12] << 8) | buf[13]; // 陀螺仪Z轴
+
+    // 步骤4：转换为物理值（原始值 / 灵敏度）
+    data->ax = data->ax_raw / ACCEL_SENSITIVITY;
+    data->ay = data->ay_raw / ACCEL_SENSITIVITY;
+    data->az = data->az_raw / ACCEL_SENSITIVITY;
+    data->gx = data->gx_raw / GYRO_SENSITIVITY;
+    data->gy = data->gy_raw / GYRO_SENSITIVITY;
+    data->gz = data->gz_raw / GYRO_SENSITIVITY;
+
+    return ESP_OK;
+}
+
+
+// -------------------------- 7. 主任务（循环读取+打印数据）--------------------------
+void app_main(void) {
+    mpu6050_data_t mpu_data;
+    memset(&mpu_data, 0, sizeof(mpu6050_data_t));  // 初始化数据结构体
+
+    // 初始化I2C和MPU6050（失败则退出）
+    if (i2c_master_init() != ESP_OK) {
+        ESP_LOGE(TAG, "I2C初始化失败，程序退出");
+        return;
+    }
+    if (mpu6050_init() != ESP_OK) {
+        ESP_LOGE(TAG, "MPU6050初始化失败，程序退出");
+        return;
+    }
+
+    // 循环读取并打印数据
+    while (1) {
+        if (mpu6050_read_data(&mpu_data) == ESP_OK) {
+            // 打印原始值（调试用）和物理值（实际应用用）
+            ESP_LOGI(TAG, "=== 加速度计 ===");
+            ESP_LOGI(TAG, "原始值: X=%d, Y=%d, Z=%d", mpu_data.ax_raw, mpu_data.ay_raw, mpu_data.az_raw);
+            ESP_LOGI(TAG, "物理值: X=%.2fg, Y=%.2fg, Z=%.2fg（1g≈9.8m/s²）", 
+                     mpu_data.ax, mpu_data.ay, mpu_data.az);
+            
+            ESP_LOGI(TAG, "=== 陀螺仪 ===");
+            ESP_LOGI(TAG, "原始值: X=%d, Y=%d, Z=%d", mpu_data.gx_raw, mpu_data.gy_raw, mpu_data.gz_raw);
+            ESP_LOGI(TAG, "物理值: X=%.2f°/s, Y=%.2f°/s, Z=%.2f°/s", 
+                     mpu_data.gx, mpu_data.gy, mpu_data.gz);
+            
+            ESP_LOGI(TAG, "-------------------------\n");  // 分隔符
+        } else {
+            ESP_LOGE(TAG, "数据读取失败，重试...");
+        }
+
+        vTaskDelay(TASK_DELAY_MS / portTICK_PERIOD_MS);  // 延时（FreeRTOS延时函数）
+    }
+}
