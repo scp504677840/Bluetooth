@@ -1,6 +1,6 @@
 /* ESP32-S3 BLE GATT Server 完整示例
  * 基于 ESP-IDF v5.5.1
- * 功能: BLE 服务器，支持读写特征，LED 控制
+ * 功能: BLE 服务器，支持读写特征
  */
 
 #include "esp_log.h"
